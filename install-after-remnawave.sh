@@ -253,7 +253,7 @@ ensure_beszel_agent() {
 usage() {
   cat <<'EOF'
 Usage:
-  bash remnawave-bootstrap.sh [options]
+  bash install-after-remnawave.sh [options]
 
 Options:
   --authorized-key <key>  Add SSH public key to /root/.ssh/authorized_keys
