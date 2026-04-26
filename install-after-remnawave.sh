@@ -23,47 +23,33 @@ os_id() {
   printf '%s' "unknown"
 }
 
-apt_install() {
+require_apt_debian_family() {
+  local id
+  id="$(os_id)"
+  [[ "$id" == "debian" || "$id" == "ubuntu" ]] || die "this script supports Debian/Ubuntu only (ID=${id})"
+}
+
+APT_UPDATED=0
+
+apt_ensure_updated() {
+  [[ "${APT_UPDATED}" == 1 ]] && return 0
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
+  APT_UPDATED=1
+}
+
+apt_install() {
+  apt_ensure_updated
   apt-get install -y --no-install-recommends "$@"
 }
 
-ensure_packages_common() {
-  # Keep it minimal and safe.
+ensure_htop() {
   if have_cmd htop; then
+    log "htop already installed; skipping"
     return 0
   fi
-  log "Installing common utilities (htop)"
+  log "Installing htop"
   apt_install htop
-}
-
-ensure_docker_debian() {
-  if have_cmd docker && have_cmd docker-compose; then
-    systemctl enable --now docker >/dev/null 2>&1 || true
-    return 0
-  fi
-
-  log "Installing Docker + docker-compose (Debian repo packages)"
-  apt_install ca-certificates curl docker.io docker-compose
-  systemctl enable --now docker
-}
-
-ensure_docker_ubuntu() {
-  # Ubuntu often provides compose as a plugin; accept either form.
-  if have_cmd docker && ( docker compose version >/dev/null 2>&1 || have_cmd docker-compose ); then
-    systemctl enable --now docker >/dev/null 2>&1 || true
-    return 0
-  fi
-
-  log "Installing Docker + Compose (Ubuntu repo packages)"
-  apt_install ca-certificates curl docker.io
-  if apt-get install -y --no-install-recommends docker-compose-plugin >/dev/null 2>&1; then
-    :
-  else
-    apt_install docker-compose
-  fi
-  systemctl enable --now docker
 }
 
 compose_cmd() {
@@ -78,15 +64,12 @@ compose_cmd() {
   return 1
 }
 
-ensure_docker() {
-  case "$(os_id)" in
-    debian) ensure_docker_debian ;;
-    ubuntu) ensure_docker_ubuntu ;;
-    *)
-      warn "Unknown OS ID: $(os_id). Trying Debian-style Docker install."
-      ensure_docker_debian
-      ;;
-  esac
+require_docker_for_beszel() {
+  have_cmd docker || die "docker not found; install Docker on Debian yourself, then re-run"
+  compose_cmd >/dev/null 2>&1 || die "docker compose not found; install compose (plugin or docker-compose), then re-run"
+  if ! docker info >/dev/null 2>&1; then
+    die "docker daemon not reachable (docker info failed); start docker and retry"
+  fi
 }
 
 ensure_root_authorized_keys() {
@@ -94,34 +77,49 @@ ensure_root_authorized_keys() {
   local ssh_dir="/root/.ssh"
   local auth_keys="${ssh_dir}/authorized_keys"
 
+  # Directory: only root may traverse (sshd requirement for key-based login).
   mkdir -p "$ssh_dir"
   chown root:root "$ssh_dir"
   chmod 700 "$ssh_dir"
 
-  touch "$auth_keys"
+  # File: create if missing; root-owned, not group/world readable/writable.
+  if [[ ! -f "$auth_keys" ]]; then
+    : >"$auth_keys"
+  fi
   chown root:root "$auth_keys"
   chmod 600 "$auth_keys"
+
+  # Empty file: leave a short hint (lines starting with # are ignored by sshd).
+  if [[ ! -s "$auth_keys" ]]; then
+    cat >"$auth_keys" <<'KEYSHEAD'
+# SSH: один публичный ключ на строку (вставьте ниже, сохраните файл).
+# SSH: one public key per line (paste below, save).
+#
+KEYSHEAD
+    chown root:root "$auth_keys"
+    chmod 600 "$auth_keys"
+    log "Created empty $auth_keys with comments; add keys and save"
+  else
+    log "SSH $auth_keys present; permissions set to root:root 600, dir 700"
+  fi
 
   if [[ -n "$key" ]]; then
     if ! grep -Fxq "$key" "$auth_keys"; then
       printf '%s\n' "$key" >> "$auth_keys"
-      log "Added key to $auth_keys"
+      log "Appended key from --authorized-key to $auth_keys"
     else
-      log "Key already present in $auth_keys; skipping"
+      log "Key from --authorized-key already in $auth_keys; skipping"
     fi
-  else
-    log "$auth_keys ensured (no key provided)"
   fi
+
+  log "SSH access layout: $ssh_dir (drwx------ root) / $auth_keys (-rw------- root)"
 }
 
 swap_is_ok() {
-  # ok if ANY swap is enabled and total >= requested (account for rounding)
   local want_mb="$1"
   local want_kb min_kb total_kb
 
   want_kb="$(( want_mb * 1024 ))"
-  # Some tools show 1GiB swap as 1023MiB due to metadata/rounding.
-  # Accept a small tolerance (4MiB).
   min_kb="$(( want_kb - 4096 ))"
 
   total_kb="$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
@@ -132,7 +130,6 @@ ensure_swapfile() {
   local want_mb="$1"
   local swapfile="$2"
 
-  # If /etc/fstab already references this swapfile, try enabling it first.
   if grep -qE "^[[:space:]]*${swapfile//\//\\/}[[:space:]]+none[[:space:]]+swap[[:space:]]" /etc/fstab; then
     swapon "$swapfile" >/dev/null 2>&1 || true
   fi
@@ -198,56 +195,46 @@ EOF
   fi
 }
 
-write_beszel_compose() {
-  local dir="$1"
-  local listen="$2"
-  local key="$3"
-  local token="$4"
-  local hub_url="$5"
-
-  mkdir -p "$dir/beszel_agent_data"
-
-  cat > "$dir/docker-compose.yml" <<EOF
-services:
-  beszel-agent:
-    image: henrygd/beszel-agent:latest
-    container_name: beszel-agent
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./beszel_agent_data:/var/lib/beszel-agent
-    environment:
-      LISTEN: ${listen}
-      KEY: '${key}'
-      TOKEN: ${token}
-      HUB_URL: ${hub_url}
-EOF
-}
-
 ensure_beszel_agent() {
   local dir="$1"
-  local listen="$2"
-  local key="$3"
-  local token="$4"
-  local hub_url="$5"
+  local compose_file="$dir/docker-compose.yml"
+  local compose
+  local pull_out
 
   mkdir -p "$dir"
+  mkdir -p "$dir/beszel_agent_data"
 
-  if [[ ! -f "$dir/docker-compose.yml" ]]; then
-    [[ -n "$key" ]] || die "missing --key (or BESZEL_KEY)"
-    [[ -n "$token" ]] || die "missing --token (or BESZEL_TOKEN)"
-    [[ -n "$hub_url" ]] || die "missing --hub-url (or BESZEL_HUB_URL)"
-    log "Writing $dir/docker-compose.yml"
-    write_beszel_compose "$dir" "$listen" "$key" "$token" "$hub_url"
+  if [[ ! -f "$compose_file" ]]; then
+    : >"$compose_file"
+    log "Created empty $compose_file"
   else
-    log "Found existing $dir/docker-compose.yml; will pull latest and restart"
+    log "$compose_file already exists; skipping"
   fi
 
-  local c
-  c="$(compose_cmd)" || die "docker compose not found (install docker compose first)"
-  ( cd "$dir" && $c pull && $c up -d )
-  docker ps --filter name=beszel-agent --format 'table {{.Names}}\t{{.Status}}' | sed -n '1,2p' || true
+  # Optional: update existing Beszel Agent if it is already installed (container exists).
+  # We intentionally avoid failing the whole bootstrap if Docker/Compose are unavailable.
+  if have_cmd docker && docker info >/dev/null 2>&1; then
+    if compose="$(compose_cmd 2>/dev/null)"; then
+      if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -Fxq 'beszel-agent'; then
+        if [[ -s "$compose_file" ]]; then
+          log "Beszel Agent detected; checking for updates"
+          pull_out="$($compose -f "$compose_file" pull 2>&1 || true)"
+          if printf '%s\n' "$pull_out" | grep -qiE 'downloaded newer image|pull complete|digest:'; then
+            log "Beszel Agent image updated; restarting"
+          else
+            log "Beszel Agent image already up to date; ensuring it's running"
+          fi
+          $compose -f "$compose_file" up -d >/dev/null 2>&1 || warn "Beszel Agent restart failed; check docker/compose logs"
+        else
+          warn "Beszel compose file is empty ($compose_file); skipping update"
+        fi
+      fi
+    else
+      warn "docker compose not found; skipping Beszel update"
+    fi
+  else
+    warn "docker daemon not reachable; skipping Beszel update"
+  fi
 }
 
 usage() {
@@ -255,35 +242,37 @@ usage() {
 Usage:
   bash install-after-remnawave.sh [options]
 
+Debian/Ubuntu only.
+
+Steps (each skipped if already satisfied):
+  - htop (apt) if missing
+  - SSH: /root/.ssh (700) + authorized_keys (600), template if empty; optional --authorized-key
+  - swap file + fstab
+  - BBR sysctl (unless --enable-bbr 0)
+  - Beszel: create directory and empty docker-compose.yml
+
 Options:
-  --authorized-key <key>  Add SSH public key to /root/.ssh/authorized_keys
+  --authorized-key <key>  Append this pubkey to /root/.ssh/authorized_keys (optional)
   --swap-mb <int>         Swap size in MB (default: 1024)
   --swapfile <path>       Swap file path (default: /swapfile)
   --enable-bbr <0|1>      Enable BBR (default: 1)
-  --beszel-dir <path>     Beszel agent directory (default: /root/beszel-agent)
-  --listen <port>         Beszel agent listen port (default: 45876)
-  --hub-url <url>         Beszel hub URL (or env BESZEL_HUB_URL)
-  --token <token>         Beszel agent token (or env BESZEL_TOKEN)
-  --key <ssh-pubkey>      Beszel agent key (or env BESZEL_KEY)
+  --beszel-dir <path>     Beszel directory for docker-compose.yml (default: /root/beszel-agent)
 
 Examples:
-  curl -fsSL https://example.com/remnawave-bootstrap.sh | bash -s -- \
-    --hub-url http://1.2.3.4:8090/ --token abc --key 'ssh-ed25519 AAAA...'
+  bash install-after-remnawave.sh --authorized-key 'ssh-ed25519 AAAA... you@host'
 EOF
 }
 
 main() {
   require_root
+  require_apt_debian_family
+  ensure_htop
 
   local swap_mb="1024"
   local swapfile="/swapfile"
   local enable_bbr="1"
   local beszel_dir="/root/beszel-agent"
-  local listen="45876"
   local authorized_key="${AUTHORIZED_KEY:-}"
-  local hub_url="${BESZEL_HUB_URL:-}"
-  local token="${BESZEL_TOKEN:-}"
-  local key="${BESZEL_KEY:-}"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -293,20 +282,13 @@ main() {
       --swapfile) swapfile="${2:-}"; shift 2 ;;
       --enable-bbr) enable_bbr="${2:-}"; shift 2 ;;
       --beszel-dir) beszel_dir="${2:-}"; shift 2 ;;
-      --listen) listen="${2:-}"; shift 2 ;;
-      --hub-url) hub_url="${2:-}"; shift 2 ;;
-      --token) token="${2:-}"; shift 2 ;;
-      --key) key="${2:-}"; shift 2 ;;
       *) die "unknown arg: $1 (use --help)" ;;
     esac
   done
 
   [[ "$swap_mb" =~ ^[0-9]+$ ]] || die "--swap-mb must be int"
-  [[ "$listen" =~ ^[0-9]+$ ]] || die "--listen must be int"
   [[ "$enable_bbr" == "0" || "$enable_bbr" == "1" ]] || die "--enable-bbr must be 0 or 1"
 
-  ensure_docker
-  ensure_packages_common
   ensure_root_authorized_keys "$authorized_key"
   ensure_swapfile "$swap_mb" "$swapfile"
   if [[ "$enable_bbr" == "1" ]]; then
@@ -314,10 +296,10 @@ main() {
   else
     log "BBR step disabled; skipping"
   fi
-  ensure_beszel_agent "$beszel_dir" "$listen" "$key" "$token" "$hub_url"
+
+  ensure_beszel_agent "$beszel_dir"
 
   log "Done"
 }
 
 main "$@"
-
